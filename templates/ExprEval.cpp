@@ -2544,6 +2544,21 @@ static constant *reducePackedElemSelect(constant *c, int64_t selectIndex,
       if (lt->Elem_typespec()) {
         ets = lt->Elem_typespec()->Actual_typespec();
         rgs = lt->Ranges();
+      } else if (lt->Ranges() && lt->Ranges()->size() >= 2) {
+        // MULTI-RANGE packed array (`logic [0:4][31:0]` — fpnew_pkg's
+        // fmt_unsigned_t): no Elem_typespec exists; the element type is the
+        // same logic type minus the outermost range.  Without this branch the
+        // select fell through to reduceBitSelect and `FmtPipeRegs[fmt]`
+        // returned BIT fmt of the 160-bit value — fpnew slices got
+        // NumPipeRegs 1,0,0,0,0 from a '{default:1} array, lost their
+        // pipeline registers at elaboration, and CVA6's fpu_wrap/ex_stage
+        // early_valid never asserted.
+        rgs = lt->Ranges();
+        ElaboratorContext elemCtx(&s, false, muteError);
+        logic_typespec *elt = (logic_typespec *)clone_tree(lt, &elemCtx);
+        if (elt->Ranges() && !elt->Ranges()->empty())
+          elt->Ranges()->erase(elt->Ranges()->begin());
+        ets = elt;
       }
     }
   }
