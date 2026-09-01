@@ -6018,6 +6018,78 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
   return (expr *)result;
 }
 
+
+// Splice a member write's constant bits into the whole-value constant stored
+// for the base variable (param_assigns keyed by base name): keeps `return
+// res` and later whole-var reads in sync with `res.member = ...` writes —
+// without this fpnew_pkg::super_format's accumulated members never reached
+// the returned value and the paramod stamped 0.
+static bool spliceMemberIntoWhole(ExprEval *ev, Serializer &s,
+                                  const any *inst, hier_path *path,
+                                  expr *rhsexp, bool muteError) {
+  if (rhsexp == nullptr ||
+      rhsexp->UhdmType() != UHDM_OBJECT_TYPE::uhdmconstant)
+    return false;
+  if (path->Path_elems() == nullptr || path->Path_elems()->size() < 2)
+    return false;
+  const std::string_view base = path->Path_elems()->at(0)->VpiName();
+  VectorOfparam_assign *param_assigns = nullptr;
+  if (const scope *spe = any_cast<const scope *>(inst))
+    param_assigns = spe->Param_assigns();
+  if (param_assigns == nullptr) return false;
+  param_assign *base_pa = nullptr;
+  for (param_assign *pa : *param_assigns)
+    if (pa->Lhs() && pa->Lhs()->VpiName() == base) {
+      base_pa = pa;
+      break;
+    }
+  if (base_pa == nullptr) return false;
+  constant *whole = any_cast<constant *>(base_pa->Rhs());
+  if (whole == nullptr) return false;
+  const struct_typespec *stps = nullptr;
+  if (const ref_typespec *rt = whole->Typespec())
+    stps = rt->Actual_typespec<struct_typespec>();
+  if (stps == nullptr || stps->Members() == nullptr) return false;
+  // Only single-level member paths are spliced here (res.exp_bits).
+  if (path->Path_elems()->size() != 2) return false;
+  const std::string_view mname = path->Path_elems()->at(1)->VpiName();
+  uint64_t total = 0, off = 0, mw = 0;
+  bool found = false;
+  for (typespec_member *member : *stps->Members()) {
+    const typespec *mts =
+        member->Typespec() ? member->Typespec()->Actual_typespec() : nullptr;
+    bool iv = false;
+    uint64_t w = ev->size(mts, iv, inst, nullptr, true, true);
+    if (iv || w == 0) return false;
+    if (!found && member->VpiName() == mname) {
+      found = true;
+      mw = w;
+    } else if (!found) {
+      off += w;
+    }
+    total += w;
+  }
+  if (!found || mw == 0) return false;
+  std::string bin = ev->toBinary(whole);
+  if (bin.size() < total) bin.insert(bin.begin(), total - bin.size(), '0');
+  else if (bin.size() > total) bin = bin.substr(bin.size() - total);
+  std::string mbits = ev->toBinary(any_cast<constant *>(rhsexp));
+  if (mbits.size() < mw) mbits.insert(mbits.begin(), mw - mbits.size(), '0');
+  else if (mbits.size() > mw) mbits = mbits.substr(mbits.size() - mw);
+  bin.replace(off, mw, mbits);
+  constant *nc = s.MakeConstant();
+  nc->VpiValue("BIN:" + bin);
+  nc->VpiDecompile(bin);
+  nc->VpiSize(static_cast<int32_t>(bin.size()));
+  nc->VpiConstType(vpiBinaryConst);
+  ref_typespec *rtc = s.MakeRef_typespec();
+  rtc->Actual_typespec(const_cast<struct_typespec *>(stps));
+  rtc->VpiParent(nc);
+  nc->Typespec(rtc);
+  base_pa->Rhs(nc);
+  return true;
+}
+
 bool ExprEval::setValueInInstance(
     std::string_view lhs, any *lhsexp, expr *rhsexp, bool &invalidValue,
     Serializer &s, const any *inst, const any *scope_exp,
@@ -6072,6 +6144,7 @@ bool ExprEval::setValueInInstance(
         if (object->UhdmType() == UHDM_OBJECT_TYPE::uhdmtypespec_member) {
           typespec_member *tmp = (typespec_member *)object;
           tmp->Actual_value(rhsexp);
+          spliceMemberIntoWhole(this, s, inst, path, rhsexp, muteError);
           return false;
         }
       }
@@ -6421,6 +6494,7 @@ bool ExprEval::setValueInInstance(
           if (object->UhdmType() == UHDM_OBJECT_TYPE::uhdmtypespec_member) {
             typespec_member *tmp = (typespec_member *)object;
             tmp->Actual_value(rhsexp);
+            spliceMemberIntoWhole(this, s, inst, path, rhsexp, muteError);
             return false;
           }
         }
@@ -6484,6 +6558,28 @@ bool ExprEval::setValueInInstance(
           c->VpiValue("BIN:" + bval);
           c->VpiDecompile(bval);
           c->VpiSize(size);
+        }
+      }
+      // Attach the variable's declared typespec to the stored constant: a
+      // later member select on the whole-value (`res.exp_bits` after
+      // `res = '0` in fpnew_pkg::super_format) reaches
+      // hierarchicalSelector's constant branch, which needs the struct
+      // typespec to slice the member — without it the read returned null,
+      // the RHS reduce went invalid, and the function's result stamped 0.
+      if (c->Typespec() == nullptr) {
+        const typespec *lts = nullptr;
+        auto lv_it2 = local_vars.find(std::string(lhsname));
+        if (lv_it2 != local_vars.end()) lts = lv_it2->second;
+        if (lts == nullptr) {
+          if (const expr *le = any_cast<const expr *>(lhsexp)) {
+            if (le->Typespec()) lts = le->Typespec()->Actual_typespec();
+          }
+        }
+        if (lts) {
+          ref_typespec *rtc = s.MakeRef_typespec();
+          rtc->Actual_typespec(const_cast<typespec *>(lts));
+          rtc->VpiParent(c);
+          c->Typespec(rtc);
         }
       }
       param_assign *pa = s.MakeParam_assign();
