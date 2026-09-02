@@ -2605,6 +2605,22 @@ any *ExprEval::decodeHierPath(hier_path *path, bool &invalidValue,
     baseObject = firstElem->VpiName();
   }
   any *object = getObject(baseObject, inst, pexpr, muteError);
+  // A function LOCAL's var declaration shadows its staged frame value the
+  // same way it does for bit selects (see the uhdmbit_select read branch):
+  // `res.exp_bits` inside fpnew_pkg::super_format resolved the SHARED
+  // struct_var node and read the typespec-member Actual_value annotation
+  // left by a PREVIOUS instance's evaluation — {11,52} from an all-formats
+  // config leaked into every later config's SUPER_FORMAT.  For VALUE reads,
+  // prefer the frame's stored whole-value constant (kept in sync member-by-
+  // member via spliceMemberIntoWhole); the member slice then reads through
+  // its attached struct typespec.
+  if (returnType == ReturnType::VALUE && object &&
+      any_cast<variables *>(object) != nullptr) {
+    if (any *valobj = getValue(baseObject, inst, pexpr, muteError)) {
+      if (valobj->UhdmType() == UHDM_OBJECT_TYPE::uhdmconstant)
+        object = valobj;
+    }
+  }
   if (object) {
     if (param_assign *passign = any_cast<param_assign *>(object)) {
       const any *passign_lhs = passign->Lhs();
@@ -5722,8 +5738,12 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
       // A function FORMAL (io_decl) shadows its staged argument value in the
       // pexpr task_func chain; the formal carries no value, so resolve the
       // name through the value store instead (fpnew's
-      // `cfg[fmt]` inside get_conv_lane_formats).
-      if (object && object->UhdmType() == UHDM_OBJECT_TYPE::uhdmio_decl) {
+      // `cfg[fmt]` inside get_conv_lane_formats).  A function LOCAL's var
+      // declaration shadows the same way (`lanefmts[fmt]` inside
+      // get_conv_lane_int_formats after `lanefmts = get_conv_lane_formats(...)`
+      // — the logic_var won the lookup and the whole RHS went invalid).
+      if (object && (object->UhdmType() == UHDM_OBJECT_TYPE::uhdmio_decl ||
+                     any_cast<variables *>(object) != nullptr)) {
         if (any *valobj = getValue(name, inst, pexpr, muteError))
           object = valobj;
       }
@@ -5854,12 +5874,13 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
                   (constant *)object, (int64_t)index_val, this, s,
                   invalidValue, inst, pexpr, muteError)) {
             result = ec;
-          } else {
+                  } else {
             result = reduceBitSelect((constant *)object,
                                      static_cast<uint32_t>(index_val),
                                      invalidValue, inst, pexpr);
-          }
-        }
+                  }
+        } else {
+              }
       }
     }
   } else if (objtype == UHDM_OBJECT_TYPE::uhdmpart_select) {
@@ -6266,6 +6287,14 @@ bool ExprEval::setValueInInstance(
               lhsbinary += "x";
             }
           }
+          // Pad an undersized previous value to the declared width — a
+          // caller-frame local with the same name (get_conv_lane_int_formats'
+          // 4-bit `res` shadowing get_conv_lane_formats' 5-bit `res`) loads a
+          // short string, the top windex write lands outside it and drops
+          // silently (fpnew: the FP32 term of every CONV lane's int-format
+          // mask, CONV_INT_FORMATS 1101 instead of 1111).
+          while (lhsbinary.size() < si) lhsbinary += 'x';
+
           uint64_t base = get_uvalue(
               invalidValue, reduceExpr(sel->Base_expr(), invalidValue, inst,
                                        lhsexp, muteError));
@@ -6324,6 +6353,14 @@ bool ExprEval::setValueInInstance(
               lhsbinary += "x";
             }
           }
+          // Pad an undersized previous value to the declared width — a
+          // caller-frame local with the same name (get_conv_lane_int_formats'
+          // 4-bit `res` shadowing get_conv_lane_formats' 5-bit `res`) loads a
+          // short string, the top windex write lands outside it and drops
+          // silently (fpnew: the FP32 term of every CONV lane's int-format
+          // mask, CONV_INT_FORMATS 1101 instead of 1111).
+          while (lhsbinary.size() < si) lhsbinary += 'x';
+
           uint64_t left = get_uvalue(
               invalidValue, reduceExpr(sel->Left_range(), invalidValue, inst,
                                        lhsexp, muteError));
@@ -6404,6 +6441,14 @@ bool ExprEval::setValueInInstance(
             }
           }
 
+          // Pad an undersized previous value to the declared width — a
+          // caller-frame local with the same name (get_conv_lane_int_formats'
+          // 4-bit `res` shadowing get_conv_lane_formats' 5-bit `res`) loads a
+          // short string, the top windex write lands outside it and drops
+          // silently (fpnew: the FP32 term of every CONV lane's int-format
+          // mask, CONV_INT_FORMATS 1101 instead of 1111).
+          while (lhsbinary.size() < si) lhsbinary += 'x';
+
           int64_t size_rhs = ((constant *)rhsexp)->VpiSize();
           if ((wordSize != 1) && (((int64_t)wordSize) < size_rhs))
             size_rhs = wordSize;
@@ -6450,7 +6495,23 @@ bool ExprEval::setValueInInstance(
           for (int32_t i = 0; i < size_rhs; i++) {
             if ((((windex * size_rhs) + i) < si) &&
                 (((windex * size_rhs) + i) < lhsbinary.size())) {
-              lhsbinary[(windex * size_rhs) + i] = tobinary[i];
+              char newc = tobinary[i];
+              // Compound assignment (`res[i] |= term`): fold the previous
+              // bit in — the plain overwrite made each accumulate-loop
+              // iteration clobber the earlier ones (fpnew_pkg::
+              // get_conv_lane_int_formats kept only its last iteration).
+              char oldc = lhsbinary[(windex * size_rhs) + i];
+              if (oldc == '0' || oldc == '1') {
+                int ob = (oldc == '1');
+                int nb = (newc == '1');
+                switch (opType) {
+                  case vpiBitOrOp:  newc = (ob | nb) ? '1' : '0'; break;
+                  case vpiBitAndOp: newc = (ob & nb) ? '1' : '0'; break;
+                  case vpiBitXorOp: newc = (ob ^ nb) ? '1' : '0'; break;
+                  default: break;
+                }
+              }
+              lhsbinary[(windex * size_rhs) + i] = newc;
             }
           }
           std::reverse(lhsbinary.begin(), lhsbinary.end());
