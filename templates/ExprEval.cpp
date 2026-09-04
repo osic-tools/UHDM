@@ -346,8 +346,28 @@ any *ExprEval::getValue(std::string_view name, const any *inst,
           for (auto c : *e->Enum_consts()) {
             if (c->VpiName() == the_name) {
               constant *cc = s.MakeConstant();
-              cc->VpiValue(c->VpiValue());
+              const std::string_view v = c->VpiValue();
+              cc->VpiValue(v);
               cc->VpiSize(c->VpiSize());
+              // enum_const has no VpiConstType; derive it from the value
+              // prefix so downstream folds (e.g. the concat reduction's
+              // switch on VpiConstType) don't misparse the string — an
+              // unset type falls into the UINT:/IINT: default branch,
+              // which turns "HEX:6f" into 0.
+              if (v.find("HEX:") == 0)
+                cc->VpiConstType(vpiHexConst);
+              else if (v.find("BIN:") == 0)
+                cc->VpiConstType(vpiBinaryConst);
+              else if (v.find("OCT:") == 0)
+                cc->VpiConstType(vpiOctConst);
+              else if (v.find("DEC:") == 0)
+                cc->VpiConstType(vpiDecConst);
+              else if (v.find("UINT:") == 0)
+                cc->VpiConstType(vpiUIntConst);
+              else if (v.find("INT:") == 0)
+                cc->VpiConstType(vpiIntConst);
+              else if (v.find("STRING:") == 0)
+                cc->VpiConstType(vpiStringConst);
               result = cc;
               break;
             }
@@ -4835,6 +4855,59 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
                       sv.remove_prefix(std::string_view("UINT:").length());
                       uint64_t iv = 0;
                       if (NumUtils::parseUint64(sv, &iv) == nullptr) {
+                        iv = 0;
+                      }
+                      std::string bin = NumUtils::toBinary(size, iv);
+                      if (op->VpiReordered()) {
+                        std::reverse(bin.begin(), bin.end());
+                      }
+                      cval += bin;
+                    } else if (sv.find("HEX:") == 0) {
+                      // A constant with an unset VpiConstType can still
+                      // carry a typed value string (enum_const values are
+                      // stored as HEX:); parse by prefix instead of
+                      // misreading it through the IINT: fallback below,
+                      // which would fold the operand to 0.
+                      sv.remove_prefix(std::string_view("HEX:").length());
+                      std::string tmp = NumUtils::hexToBin(sv);
+                      std::string value;
+                      if (size > (int32_t)tmp.size()) {
+                        value.append(size - tmp.size(), '0');
+                      } else if (size < (int32_t)tmp.size()) {
+                        tmp.erase(0, (int32_t)tmp.size() - size);
+                      }
+                      if (op->VpiReordered()) {
+                        std::reverse(tmp.begin(), tmp.end());
+                      }
+                      value += tmp;
+                      cval += value;
+                    } else if (sv.find("BIN:") == 0) {
+                      sv.remove_prefix(std::string_view("BIN:").length());
+                      std::string value;
+                      if (size > (int32_t)sv.size()) {
+                        value.append(size - sv.size(), '0');
+                      }
+                      if (op->VpiReordered()) {
+                        value.append(sv.rbegin(), sv.rend());
+                      } else {
+                        value.append(sv.begin(), sv.end());
+                      }
+                      cval += value;
+                    } else if (sv.find("DEC:") == 0) {
+                      sv.remove_prefix(std::string_view("DEC:").length());
+                      int64_t iv = 0;
+                      if (NumUtils::parseInt64(sv, &iv) == nullptr) {
+                        iv = 0;
+                      }
+                      std::string bin = NumUtils::toBinary(size, iv);
+                      if (op->VpiReordered()) {
+                        std::reverse(bin.begin(), bin.end());
+                      }
+                      cval += bin;
+                    } else if (sv.find("OCT:") == 0) {
+                      sv.remove_prefix(std::string_view("OCT:").length());
+                      int64_t iv = 0;
+                      if (NumUtils::parseOctal(sv, &iv) == nullptr) {
                         iv = 0;
                       }
                       std::string bin = NumUtils::toBinary(size, iv);
